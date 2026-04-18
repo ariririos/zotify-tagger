@@ -1,0 +1,13 @@
+   Compiling zotify-tagger v0.1.0 (/home/aririos/dev/zotify-tagger)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.24s
+     Running `target/debug/zotify-tagger --tag popularity --tag genre --use-cache`
+Getting folders in /media/aririos/Files/zotify
+Processing folders...
+46727 tracks found successfully
+...including 1000 duplicates
+...excluding 826 tracks not found
+...and 0 errors
+Grabbing tags from disk...
+All tags found in cache!
+Writing tags to 45728 audio files...
+Finished!

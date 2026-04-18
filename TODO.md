@@ -8,6 +8,6 @@ The genre-writing code (starting `thread::scope(|scope| {`) probably doesn't ben
 since you quickly run into a CPU iowait situation. It might be beneficial to work in a tmpfs and then copy the outputted songs
 over in larger batches. 
 
-Right now this just overwrites the genres already present with Spotify's genres, which might be problematic if you 
-use something like Musicbrainz Picard to get song-level data rather than Spotify's artist-level data. For large music
+Right now this just overwrites the genres already present with upstream genres, which might be problematic if you 
+use something like Musicbrainz Picard to get song-level data rather than "official" artist-level data. For large music
 libraries I've found that Musicbrainz typically only has genres for a small fraction of your music though.

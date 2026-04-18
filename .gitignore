@@ -1,3 +1,5 @@
 /target
 .env
 .vscode
+tags_by_track.json
+tagger.log
