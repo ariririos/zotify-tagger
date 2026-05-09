@@ -471,7 +471,7 @@ async fn create_tag_task(
                     if !stored_tags.contains(&property) {
                         stored_tags.push(property.clone());
                     }
-                    if !stored_tags.contains(&Tag::_Written(false)) {
+                    if !stored_tags.iter().any(|t| matches!(t, Tag::_Written(_))) {
                         stored_tags.push(Tag::_Written(false));
                     }
                 })
@@ -600,11 +600,7 @@ fn write_tags(
         "write_tags(paths_to_tag.len(): {})",
         paths_to_tag.lock().expect("Poisoned lock").len()
     );
-    let tags_for_disk = Arc::new(Mutex::new(
-        tags_by_track.read().expect("Poisoned lock").clone(),
-    ));
-    let tags_read_lock = tags_by_track.read().expect("Poisoned lock");
-    let tags_len = tags_read_lock.len();
+    let tags_len = tags_by_track.read().expect("Poisoned lock").len();
     println!("Writing tags to {tags_len} audio files...");
 
     ffmpeg_next::init()?;
@@ -620,12 +616,12 @@ fn write_tags(
     for _ in 0..num_workers {
         let rx = rx.clone();
         let paths_to_tag = Arc::clone(&paths_to_tag);
-        let tags_for_disk = Arc::clone(&tags_for_disk);
+        let tags_by_track = Arc::clone(&tags_by_track);
         let progress_tx = progress_tx.clone();
         handles.push(thread::spawn(move || {
             while let Ok((track, tags)) = rx.lock().expect("Poisoned lock").recv() {
                 let paths_to_tag = Arc::clone(&paths_to_tag);
-                let tags_to_write = Arc::clone(&tags_for_disk);
+                let tags_by_track = Arc::clone(&tags_by_track);
                 let paths = paths_to_tag.lock().expect("Poisoned lock");
                 let Some(path) = paths.get(&track) else {
                     warn!("Expected to find track {track} in paths_to_tag, skipping...");
@@ -674,7 +670,7 @@ fn write_tags(
                     }
                 }
                 let mut metadata_changed = false;
-                for tag in tags {
+                for tag in tags.iter().filter(|tag| !matches!(tag, Tag::_Written(_))) {
                     let tag_name = tag.get_message().expect("Tag without message");
                     let tag_contents = tag.to_string();
                     match context_or_stream {
@@ -729,7 +725,7 @@ fn write_tags(
                 if !metadata_changed {
                     fs::remove_file(&temp_path).unwrap();
                     progress_tx.send(Completion(1)).unwrap();
-                    set_track_written(tags_to_write, track);
+                    set_track_written(tags_by_track, track);
                     continue;
                 }
 
@@ -777,21 +773,14 @@ fn write_tags(
                         path.display()
                     )
                 });
-                set_track_written(tags_to_write, track);
+                set_track_written(tags_by_track, track);
                 progress_tx.send(Completion(1)).unwrap()
             }
         }));
     }
 
-    for (track, tags) in tags_read_lock.iter() {
-        tx.send((
-            track.clone(),
-            tags.iter()
-                .filter(|tag| !matches!(tag, Tag::_Written(_)))
-                .cloned()
-                .collect::<Vec<_>>()
-                .clone(),
-        ))?;
+    for (track, tags) in tags_by_track.read().expect("Poisoned lock").iter() {
+        tx.send((track.clone(), tags.clone()))?;
     }
 
     drop(progress_tx); // need to drop all tx to make progress_rx return Err
@@ -826,9 +815,9 @@ fn write_tags(
     Ok(())
 }
 
-fn set_track_written(tags_to_write: Arc<Mutex<TagsByTrack>>, track: TrackId<'static>) {
+fn set_track_written(tags_to_write: Arc<RwLock<TagsByTrack>>, track: TrackId<'static>) {
     *tags_to_write
-        .lock()
+        .write()
         .expect("Poisoned lock")
         .get_mut(&track)
         .expect("Missing track ID")
