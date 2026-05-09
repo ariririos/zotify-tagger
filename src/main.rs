@@ -5,16 +5,20 @@
 //! Adds additional metadata (e.g. popularity, upstream links, explicit flag)
 #![feature(closure_lifetime_binder)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_scoped::{Scope, TokioScope};
 use clap::{Parser, ValueEnum};
-use dotenvy;
 use ffmpeg_next::{
-    Rational, Stream, codec, encoder,
-    format::{self, context::Input},
+    Rational, Stream, StreamMut, codec,
+    dictionary::Owned,
+    encoder,
+    format::{
+        self,
+        context::{Input, Output},
+    },
     media,
 };
-use log::{debug, error, info, warn};
+use log::{debug, info, trace, warn};
 use rand::Rng;
 use rspotify::{
     ClientCredsSpotify, ClientError, Credentials,
@@ -23,13 +27,13 @@ use rspotify::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize};
-// use sqlite::Connection;
+use serde_json::json;
 use std::{
     collections::HashMap,
     fs::File,
     io::Read,
     sync::{Arc, Mutex, RwLock, mpsc},
-    thread,
+    thread::{self, available_parallelism},
 };
 use std::{env, time::Duration};
 use std::{
@@ -41,13 +45,13 @@ use std::{path::PathBuf, time::Instant};
 use strum::{EnumDiscriminants, EnumMessage};
 use tokio::{self, sync::mpsc as async_mpsc};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     /// Dry run (don't write to disk)
     #[arg(short, long)]
     dry_run: bool,
     #[arg(short, long, value_enum)]
-    tag: Vec<TagMarker>,
+    tag: Vec<TagType>,
     /// Load cache from disk (./tags_by_track.json). To reset the cache, simply delete the file
     #[arg(short, long)]
     use_cache: bool,
@@ -81,9 +85,6 @@ fn insert_song_path(
     paths_by_track_id: Arc<Mutex<HashMap<TrackId, PathBuf>>>,
     album_folder: &Vec<Result<DirEntry, Error>>,
 ) -> Result<InsertResult> {
-    // trace!(
-    //     "insert_song_path(id: {id:?}, song_result_wrapped: {song_result_wrapped:?}, paths_by_track_id: {paths_by_track_id:?}, album_folder: {album_folder:?})"
-    // );
     let result_type;
     match song_result_wrapped {
         Ok(song_result) => {
@@ -99,7 +100,7 @@ fn insert_song_path(
         }
         Err(e) => {
             result_type = InsertResult::Error;
-            error!("Error on retrieving song path at album_folder {album_folder:?}: {e}");
+            eprintln!("Error on retrieving song path at album_folder {album_folder:?}: {e}");
         }
     }
 
@@ -153,9 +154,9 @@ fn populate_paths(
                 match song {
                     Some(song_result_wrapped) => {
                         insert_result = insert_song_path(
-                            id.get(0).unwrap().to_string(),
+                            id.first().unwrap().to_string(),
                             song_result_wrapped,
-                            Arc::clone(&paths_by_track_id),
+                            Arc::clone(paths_by_track_id),
                             &album_folder,
                         )?;
                     }
@@ -167,9 +168,9 @@ fn populate_paths(
                         match song {
                             Some(song_result_wrapped) => {
                                 insert_result = insert_song_path(
-                                    id.get(0).unwrap().to_string(),
+                                    id.first().unwrap().to_string(),
                                     song_result_wrapped,
-                                    Arc::clone(&paths_by_track_id),
+                                    Arc::clone(paths_by_track_id),
                                     &album_folder,
                                 )?;
                             }
@@ -206,9 +207,9 @@ fn populate_paths(
     })
 }
 
-#[derive(Debug, EnumDiscriminants, EnumMessage, Serialize, Deserialize, Clone)]
+#[derive(Debug, EnumDiscriminants, EnumMessage, Serialize, Deserialize, Clone, PartialEq)]
 #[strum_discriminants(derive(ValueEnum, Serialize, Deserialize, Hash, PartialOrd, Ord))]
-#[strum_discriminants(name(TagMarker))]
+#[strum_discriminants(name(TagType))]
 enum Tag {
     #[strum(message = "album")]
     Album(SimplifiedAlbum),
@@ -250,56 +251,54 @@ enum Tag {
     Type(Type),
     #[strum(message = "genre")]
     Genre(Vec<String>), // this is an artist-level tag not track-level
+    #[strum(message = "_written")]
+    _Written(bool), // not a real tag, just a flag for whether the tag was actually written to disk
 }
 
 impl Display for Tag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sep = ", ";
-        let output = match &self {
-            &Tag::Album(album) => &album.name.clone(),
-            &Tag::Artists(artists) => &artists
+        let output = match self {
+            Tag::Album(album) => album.name.clone(),
+            Tag::Artists(artists) => artists
                 .iter()
                 .map(|artist: &SimplifiedArtist| artist.name.clone())
                 .collect::<Vec<_>>()
                 .join(sep),
-            &Tag::AvailableMarkets(markets) => &markets.join(sep),
-            &Tag::DiscNumber(disc_num) => &disc_num.to_string(),
-            &Tag::Duration(duration) => &duration.as_secs().to_string(),
-            &Tag::Explicit(explicit) => &explicit.to_string(),
-            &Tag::ExternalIds(external_ids) => &external_ids
+            Tag::AvailableMarkets(markets) => markets.join(sep),
+            Tag::DiscNumber(disc_num) => disc_num.to_string(),
+            Tag::Duration(duration) => duration.as_secs().to_string(),
+            Tag::Explicit(explicit) => explicit.to_string(),
+            Tag::ExternalIds(external_ids) => external_ids
                 .iter()
                 .map(|(kind, id)| kind.to_owned() + ": " + id)
                 .collect::<Vec<_>>()
                 .join(";"),
-            &Tag::ExternalUrls(external_urls) => &external_urls
+            Tag::ExternalUrls(external_urls) => external_urls
                 .iter()
                 .map(|(kind, url)| kind.to_owned() + ": " + url)
                 .collect::<Vec<_>>()
                 .join(";"),
-            &Tag::Genre(genres) => &genres.join(sep),
-            &Tag::Href(href) => &href.clone().unwrap_or("".to_string()),
-            &Tag::Id(_id) => todo!(),
-            &Tag::IsLocal(is_local) => &is_local.to_string(),
-            &Tag::IsPlayable(is_playable) => &is_playable.unwrap_or(false).to_string(),
-            &Tag::LinkedFrom(_linked_from) => todo!(),
-            &Tag::Name(name) => &name.clone(),
-            &Tag::Popularity(popularity) => &popularity.to_string(),
-            &Tag::PreviewUrl(preview_url) => &preview_url.clone().unwrap_or("".to_string()),
-            &Tag::Restrictions(_restrictions) => todo!(),
-            &Tag::TrackNumber(track_number) => &track_number.to_string(),
-            &Tag::Type(type_param) => &type_param.to_string(),
+            Tag::Genre(genres) => genres.join(sep),
+            Tag::Href(href) => href.clone().unwrap_or("".to_string()),
+            Tag::Id(_id) => todo!(),
+            Tag::IsLocal(is_local) => is_local.to_string(),
+            Tag::IsPlayable(is_playable) => is_playable.unwrap_or(false).to_string(),
+            Tag::LinkedFrom(_linked_from) => todo!(),
+            Tag::Name(name) => name.clone(),
+            Tag::Popularity(popularity) => popularity.to_string(),
+            Tag::PreviewUrl(preview_url) => preview_url.clone().unwrap_or("".to_string()),
+            Tag::Restrictions(_restrictions) => todo!(),
+            Tag::TrackNumber(track_number) => track_number.to_string(),
+            Tag::Type(type_param) => type_param.to_string(),
+            Tag::_Written(value) => value.to_string(),
         };
         write!(f, "{}", output)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TagsByTrack {
-    tags: HashMap<TrackId<'static>, HashMap<TagMarker, Tag>>,
-}
-
 type PathsByTrackId = HashMap<TrackId<'static>, PathBuf>;
-type GenresByArtist = HashMap<ArtistId<'static>, Vec<String>>;
+type TagsByTrack = HashMap<TrackId<'static>, Vec<Tag>>;
 
 async fn backoff_429<T>(res: Result<Vec<T>, ClientError>) -> Result<Vec<T>, ClientError> {
     match res {
@@ -331,7 +330,10 @@ async fn backoff_429<T>(res: Result<Vec<T>, ClientError>) -> Result<Vec<T>, Clie
                     panic!("Unknown HTTP status code: {code}");
                 }
             }
-            other_error => panic!("Unknown http error: {other_error}"),
+            HttpError::Client(response) => panic!(
+                "HTTP client error: {response} (from URL {})",
+                response.url().map(|url| url.as_str()).unwrap_or("???")
+            ),
         },
         Err(e) => panic!("Unknown client error: {e}"),
     }
@@ -346,192 +348,144 @@ async fn random_delay(num_paths: u64, initial_delay_multiplier: Option<u64>) {
 
 struct Completion(usize);
 
-async fn create_genre_task<const CHUNK_SIZE: usize>(
+async fn create_tag_task(
     spotify: Arc<ClientCredsSpotify>,
     genres_by_artist: Arc<Mutex<HashMap<ArtistId<'_>, Vec<String>>>>,
     tags_by_track: Arc<RwLock<TagsByTrack>>,
     num_paths: u64,
+    tags: &Vec<TagType>,
     path_chunk: Vec<(TrackId<'static>, PathBuf)>,
     initial_delay_multiplier: Option<u64>,
     progress_tx: tokio::sync::mpsc::Sender<Completion>,
-) -> () {
-    let chunk_len = path_chunk.len();
+) {
+    let path_chunk_len = path_chunk.len();
     random_delay(num_paths, initial_delay_multiplier).await;
     let res = spotify
         .tracks(path_chunk.into_iter().map(|(track, _)| track.clone()), None)
         .await;
     let res = backoff_429(res).await.unwrap();
     let mut artists_by_track: HashMap<TrackId, Vec<ArtistId>> = HashMap::new();
-    for track in res {
-        let id = track.id.context("while getting track ID").unwrap();
-        let artists = track.artists.clone();
-        artists_by_track.insert(
-            id,
-            artists
-                .into_iter()
-                .map(|artist| artist.id.unwrap())
-                .collect(),
-        );
-    }
-    let mut artists_by_track_orig = artists_by_track.clone();
-    let artists_len = artists_by_track
-        .iter()
-        .fold(0, |acc, (_, artists)| acc + artists.len());
-    let artist_chunks: Vec<Vec<(TrackId<'static>, Vec<ArtistId<'static>>)>> = chunk_hashmap::<CHUNK_SIZE, TrackId, Vec<ArtistId>>(
-        artists_by_track,
-        Some(artists_len),
-        // FIXME: investigate eliminating lifetimes here
-        Some(Box::new(for <'a, 'b, 'c>
-            |(track, artists): &'a (TrackId<'b>, Vec<ArtistId<'c>>)| -> Vec<(TrackId<'b>, Vec<ArtistId<'c>>)> {
-                artists.into_iter().map(|artist|
-                    (track.clone(), std::iter::once(artist.clone()).collect()))
-                    .collect()
-                })
-            )
-    );
-    let artist_chunks: Vec<Vec<Vec<ArtistId<'_>>>> = artist_chunks
-        .into_iter()
-        .map(|chunk| chunk.into_iter().map(|(_, artists)| artists).collect())
-        .collect();
-    for artist_chunk in artist_chunks {
-        if artist_chunk.len() > 0 {
-            let res = spotify
-                .artists(
-                    artist_chunk
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<ArtistId>>(),
+    if tags.contains(&TagType::Genre) {
+        for track in res.clone() {
+            let id = track.id.context("while getting track ID").unwrap();
+            artists_by_track.insert(
+                id,
+                track
+                    .artists
+                    .into_iter()
+                    .map(|artist| artist.id.unwrap())
+                    .collect(),
+            );
+        }
+        // let mut artists_by_track_orig = artists_by_track.clone();
+        let artists_len = artists_by_track
+            .iter()
+            .fold(0, |acc, (_, artists)| acc + artists.len());
+        let artist_chunks: Vec<Vec<Vec<ArtistId<'_>>>> = chunk_hashmap::<{ rspotify::DEFAULT_PAGINATION_CHUNKS as usize }, TrackId, Vec<ArtistId>>(
+            artists_by_track.clone(),
+            Some(artists_len),
+            Some(Box::new(
+                |(track, artists): & (TrackId<'static>, Vec<ArtistId<'static>>)| -> Vec<(TrackId<'static>, Vec<ArtistId<'static>>)> {
+                    artists.iter().map(|artist|
+                        (track.clone(), std::iter::once(artist.clone()).collect()))
+                        .collect()
+                    })
                 )
-                .await;
-            // .context("while getting Spotify artists list")
-            // .unwrap();
-            let res = backoff_429(res).await.unwrap();
-            for artist in res {
-                genres_by_artist
-                    .lock()
-                    .unwrap()
-                    .insert(artist.id, artist.genres);
+            )
+            .into_iter()
+            .map(|chunk| chunk.into_iter().map(|(_, artists)| artists).collect())
+            .collect();
+        for artist_chunk in artist_chunks {
+            if !artist_chunk.is_empty() {
+                let res = spotify
+                    .artists(
+                        artist_chunk
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<ArtistId>>(),
+                    )
+                    .await;
+                let res = backoff_429(res).await.unwrap();
+                for artist in res {
+                    genres_by_artist
+                        .lock()
+                        .expect("Poisoned lock")
+                        .insert(artist.id, artist.genres);
+                }
             }
         }
     }
-    for (artist, genres) in genres_by_artist.lock().unwrap().iter() {
-        artists_by_track_orig.retain(|track, artists| {
-            if artists.contains(&artist) {
-                tags_by_track
-                    // .lock()
-                    .write()
-                    .unwrap()
-                    .tags
-                    .entry(track.clone())
-                    .and_modify(|tags| {
-                        tags.entry(TagMarker::Genre)
-                            .and_modify(|tag| match tag {
-                                Tag::Genre(existing) => existing.append(&mut genres.clone()),
-                                _ => unreachable!(),
-                            })
-                            .or_insert(Tag::Genre(genres.to_vec()));
-                    })
-                    .or_insert(HashMap::from([(
-                        TagMarker::Genre,
-                        Tag::Genre(genres.clone()),
-                    )]));
-                if artists.len() == 1 {
-                    false
-                } else if artists.len() > 1 {
-                    let artist_idx = artists.iter().position(|art| *art == *artist);
-                    if let Some(idx) = artist_idx {
-                        artists.remove(idx);
-                    } else {
-                        error!("Artist shouldn't have been removed already: {artist:?}");
-                    }
-                    true
-                } else {
-                    error!("Artist should've been removed by now: {artist:?}");
-                    false
-                }
-            } else {
-                true
-            }
-        });
-    }
-    if artists_by_track_orig.len() != 0 {
-        error!("Artists without matching track: {artists_by_track_orig:?}");
-    }
-    progress_tx.send(Completion(chunk_len)).await.unwrap();
-}
 
-async fn create_track_tag_task<const CHUNK_SIZE: usize>(
-    spotify: Arc<ClientCredsSpotify>,
-    tags_by_track: Arc<RwLock<TagsByTrack>>,
-    num_paths: u64,
-    tags: Vec<TagMarker>,
-    path_chunk: Vec<(TrackId<'static>, PathBuf)>,
-    initial_delay_multiplier: Option<u64>,
-    progress_tx: tokio::sync::mpsc::Sender<Completion>,
-) -> () {
-    let chunk_len = path_chunk.len();
-    random_delay(num_paths, initial_delay_multiplier).await;
-    let res = spotify
-        .tracks(path_chunk.into_iter().map(|(track, _)| track.clone()), None)
-        .await;
-    let res = backoff_429(res).await.unwrap();
     for track in res {
         let id = track.id.clone().context("while getting track ID").unwrap();
 
-        for tag_marker in &tags {
+        for &tag_type in tags {
             let track = track.clone();
-            let property = match tag_marker {
-                TagMarker::Album => Tag::Album(track.album),
-                TagMarker::Artists => Tag::Artists(track.artists),
-                TagMarker::AvailableMarkets => Tag::AvailableMarkets(track.available_markets),
-                TagMarker::DiscNumber => Tag::DiscNumber(track.disc_number),
-                TagMarker::Duration => {
+            let property = match tag_type {
+                TagType::Album => Tag::Album(track.album),
+                TagType::Artists => Tag::Artists(track.artists),
+                TagType::AvailableMarkets => Tag::AvailableMarkets(track.available_markets),
+                TagType::DiscNumber => Tag::DiscNumber(track.disc_number),
+                TagType::Duration => {
                     Tag::Duration(Duration::from_secs(track.duration.num_seconds() as u64))
                 }
-                TagMarker::Explicit => Tag::Explicit(track.explicit),
-                TagMarker::ExternalIds => Tag::ExternalIds(track.external_ids),
-                TagMarker::ExternalUrls => Tag::ExternalUrls(track.external_urls),
-                TagMarker::Genre => panic!(
-                    "create_track_tag_task does not support genre tagging, use create_genre_task for that"
+                TagType::Explicit => Tag::Explicit(track.explicit),
+                TagType::ExternalIds => Tag::ExternalIds(track.external_ids),
+                TagType::ExternalUrls => Tag::ExternalUrls(track.external_urls),
+                TagType::Genre => Tag::Genre(
+                    track
+                        .artists
+                        .iter()
+                        .filter_map(|artist| {
+                            artist.id.as_ref().and_then(|id| {
+                                genres_by_artist
+                                    .lock()
+                                    .expect("Poisoned lock")
+                                    .get(id)
+                                    .cloned()
+                            })
+                        })
+                        .flatten()
+                        .collect(),
                 ),
-                TagMarker::Href => Tag::Href(track.href),
-                TagMarker::Id => Tag::Id(Some(id.clone())),
-                TagMarker::IsLocal => Tag::IsLocal(track.is_local),
-                TagMarker::IsPlayable => Tag::IsPlayable(track.is_playable),
-                TagMarker::LinkedFrom => Tag::LinkedFrom(track.linked_from),
-                TagMarker::Name => Tag::Name(track.name),
-                TagMarker::Popularity => Tag::Popularity(track.popularity),
-                TagMarker::PreviewUrl => Tag::PreviewUrl(track.preview_url),
-                TagMarker::Restrictions => Tag::Restrictions(track.restrictions),
-                TagMarker::TrackNumber => Tag::TrackNumber(track.track_number),
-                TagMarker::Type => Tag::Type(track.r#type),
+                TagType::Href => Tag::Href(track.href),
+                TagType::Id => Tag::Id(Some(id.clone())),
+                TagType::IsLocal => Tag::IsLocal(track.is_local),
+                TagType::IsPlayable => Tag::IsPlayable(track.is_playable),
+                TagType::LinkedFrom => Tag::LinkedFrom(track.linked_from),
+                TagType::Name => Tag::Name(track.name),
+                TagType::Popularity => Tag::Popularity(track.popularity),
+                TagType::PreviewUrl => Tag::PreviewUrl(track.preview_url),
+                TagType::Restrictions => Tag::Restrictions(track.restrictions),
+                TagType::TrackNumber => Tag::TrackNumber(track.track_number),
+                TagType::Type => Tag::Type(track.r#type),
+                TagType::_Written => {
+                    panic!("create_tag_task should not be writing the _written tag to disk")
+                }
             };
-            debug!("thread at {id} about to lock tags_by_track");
-            // FIXME: deadlock with only one chunk
             tags_by_track
-                // .lock()
                 .write()
                 .expect("Poisoned lock")
-                .tags
                 .entry(id.clone())
                 .and_modify(|stored_tags| {
-                    stored_tags.entry(*tag_marker).insert_entry(property);
+                    if !stored_tags.contains(&property) {
+                        stored_tags.push(property.clone());
+                    }
+                    if !stored_tags.contains(&Tag::_Written(false)) {
+                        stored_tags.push(Tag::_Written(false));
+                    }
                 })
-                .or_insert(HashMap::from_iter(vec![]));
-            debug!("thread at {id} releasing lock");
+                .or_insert(vec![Tag::_Written(false), property]);
         }
     }
-    progress_tx.send(Completion(chunk_len)).await.unwrap();
+
+    progress_tx.send(Completion(path_chunk_len)).await.unwrap();
 }
 
-/// chunk_hashmap partitions a [HashMap] into `N` chunks, with the remainder in the final chunk.
-/// `U` and `V` are the types of HashMap's keys and values, respectively.
-/// `map` is the HashMap to chunk.
+/// chunk_hashmap partitions a [HashMap]<U, V> into `N` chunks, with the remainder in the final chunk.
 /// `total_len` is the total length of the HashMap if chunking should be based on something other than `map.len()`
 /// (such as if the values are [Vec]s), otherwise None.
 /// `map_values` is a closure that is passed to [Iterator::flat_map] on the Vec<(U, V)> representation of the HashMap
-/// before chunking occurs if the values need to be remapped somehow, such as if, again, the values are [Vec]s,
-/// and you want the chunks to flatten those Vecs; otherwise, pass None::<fn(&(U, V)) -> Vec<(U, V)>>.
 fn chunk_hashmap<const N: usize, U: Clone, V: Clone>(
     map: HashMap<U, V>,
     total_len: Option<usize>,
@@ -555,12 +509,10 @@ fn chunk_hashmap<const N: usize, U: Clone, V: Clone>(
                 } else {
                     iter_as_chunks.0[i].to_vec()
                 }
+            } else if i < num_chunks - 1 {
+                iter_as_chunks.0[i].to_vec()
             } else {
-                if i < num_chunks - 1 {
-                    iter_as_chunks.0[i].to_vec()
-                } else {
-                    iter_as_chunks.1.to_vec()
-                }
+                iter_as_chunks.1.to_vec()
             }
         })
         .collect()
@@ -568,14 +520,16 @@ fn chunk_hashmap<const N: usize, U: Clone, V: Clone>(
 
 #[tokio::main]
 async fn get_tags_from_spotify(
-    args: &Args,
+    tags: Vec<TagType>,
     paths_by_track_id: Arc<Mutex<PathsByTrackId>>,
     tags_by_track: Arc<RwLock<TagsByTrack>>,
-    genres_by_artist: Arc<Mutex<GenresByArtist>>,
+    credentials: Credentials,
 ) -> Result<()> {
-    let spotify_creds = Credentials::from_env().unwrap();
+    // Only needed for genre tagging otherwise unused
+    let genres_by_artist: Arc<Mutex<HashMap<ArtistId, Vec<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    let spotify = Arc::new(ClientCredsSpotify::new(spotify_creds));
+    let spotify = Arc::new(ClientCredsSpotify::new(credentials));
 
     spotify.request_token().await?;
     const CHUNK_SIZE: usize = rspotify::DEFAULT_PAGINATION_CHUNKS as usize;
@@ -583,68 +537,57 @@ async fn get_tags_from_spotify(
     let path_chunks = chunk_hashmap::<CHUNK_SIZE, TrackId, PathBuf>(
         paths_by_track_id.lock().expect("Poisoned lock").clone(),
         None,
-        // FIXME: investigate eliminating the lifetimes here
-        None::<for<'a, 'b> fn(&'a (TrackId<'b>, PathBuf)) -> Vec<(TrackId<'b>, PathBuf)>>,
+        None::<fn(&(TrackId, PathBuf)) -> Vec<(TrackId<'static>, PathBuf)>>,
     );
 
     let (_, outputs) = TokioScope::scope_and_block(|scope: &mut Scope<'_, (), _>| {
         let (progress_tx, mut progress_rx) = async_mpsc::channel(32);
         let mut progress_total: f64 = 0.0;
         for path_chunk in path_chunks.into_iter() {
-            if path_chunk.len() > 0 {
-                // FIXME: combine create_{genre,track_tag}_task and pass one vec with all tags requested
-                for tag in &args.tag {
-                    let spotify = spotify.clone();
-                    match tag {
-                        TagMarker::Genre => {
-                            scope.spawn(create_genre_task::<CHUNK_SIZE>(
-                                spotify,
-                                Arc::clone(&genres_by_artist),
-                                Arc::clone(&tags_by_track),
-                                num_paths,
-                                path_chunk.clone(),
-                                None,
-                                progress_tx.clone(),
-                            ));
-                        }
-                        other_marker => scope.spawn(create_track_tag_task::<CHUNK_SIZE>(
-                            spotify,
-                            Arc::clone(&tags_by_track),
-                            num_paths,
-                            vec![*other_marker],
-                            path_chunk.clone(),
-                            None,
-                            progress_tx.clone(),
-                        )),
-                    }
-                }
+            if !path_chunk.is_empty() {
+                scope.spawn(create_tag_task(
+                    spotify.clone(),
+                    Arc::clone(&genres_by_artist),
+                    Arc::clone(&tags_by_track),
+                    num_paths,
+                    &tags,
+                    path_chunk,
+                    None,
+                    progress_tx.clone(),
+                ));
             }
         }
         scope.spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 progress_total += progress.0 as f64 / num_paths as f64;
                 println!("Progress: {:.2}%", progress_total * 100.0);
-                // FIXME: divide progress by total number of tags being retrieved
             }
         });
     });
 
     for output in outputs {
-        output?
-    }
-
-    let tags_json = serde_json::to_string(
-        &*tags_by_track
-            // .lock()
-            .read()
-            .expect("Poisoned lock"),
-    )?;
-
-    if args.use_cache {
-        fs::write("tags_by_track.json", tags_json)?;
+        output?;
     }
 
     Ok(())
+}
+
+trait PopularityJson {
+    fn set_popularity(&mut self, metadata: Owned<'_>, value: String) -> ();
+}
+
+impl PopularityJson for Output {
+    fn set_popularity(&mut self, mut octx_metadata: Owned<'_>, value: String) {
+        octx_metadata.set("comment", &json!({"popularity": value.parse::<i32>().expect("while parsing popularity value as i32")}).to_string());
+        self.set_metadata(octx_metadata);
+    }
+}
+
+impl PopularityJson for StreamMut<'_> {
+    fn set_popularity(&mut self, mut output_metadata: Owned<'_>, value: String) {
+        output_metadata.set("comment", &json!({"popularity": value.parse::<i32>().expect("while parsing popularity value as i32")}).to_string());
+        self.set_metadata(output_metadata);
+    }
 }
 
 fn write_tags(
@@ -653,30 +596,49 @@ fn write_tags(
     use_cache: bool,
     overwrite_tags: bool,
 ) -> Result<()> {
-    let tags_lock = tags_by_track
-        // .lock()
-        .read()
-        .expect("Poisoned lock");
-    let tags_len = tags_lock.tags.len();
+    debug!(
+        "write_tags(paths_to_tag.len(): {})",
+        paths_to_tag.lock().expect("Poisoned lock").len()
+    );
+    let tags_for_disk = Arc::new(Mutex::new(
+        tags_by_track.read().expect("Poisoned lock").clone(),
+    ));
+    let tags_read_lock = tags_by_track.read().expect("Poisoned lock");
+    let tags_len = tags_read_lock.len();
     println!("Writing tags to {tags_len} audio files...");
 
     ffmpeg_next::init()?;
-    thread::scope(|scope| {
-        let mut progress_total: f64 = 0.0;
-        let mut handles = vec![];
-        let (progress_tx, progress_rx) = mpsc::channel();
-        for (track, tags) in tags_lock.tags.iter() {
-            let progress_tx = progress_tx.clone();
-            let paths_to_tag = Arc::clone(&paths_to_tag);
-            handles.push(scope.spawn(move || {
+
+    let num_workers = available_parallelism()?.get();
+
+    let (tx, rx) = mpsc::channel::<(TrackId, Vec<Tag>)>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    let mut progress_total = 0.0;
+    let (progress_tx, progress_rx) = mpsc::channel();
+    let mut handles = vec![];
+    for _ in 0..num_workers {
+        let rx = rx.clone();
+        let paths_to_tag = Arc::clone(&paths_to_tag);
+        let tags_for_disk = Arc::clone(&tags_for_disk);
+        let progress_tx = progress_tx.clone();
+        handles.push(thread::spawn(move || {
+            while let Ok((track, tags)) = rx.lock().expect("Poisoned lock").recv() {
+                let paths_to_tag = Arc::clone(&paths_to_tag);
+                let tags_to_write = Arc::clone(&tags_for_disk);
                 let paths = paths_to_tag.lock().expect("Poisoned lock");
-                let Some(path) = paths.get(track) else {
-                    if !use_cache {
-                        warn!("Expected to find track {track} in paths_to_tag, skipping...");
-                    }
+                let Some(path) = paths.get(&track) else {
+                    warn!("Expected to find track {track} in paths_to_tag, skipping...");
                     return;
                 };
-                info!("Processing file {}", path.display());
+                if tags.iter().any(|tag| matches!(tag, Tag::_Written(true))) && !overwrite_tags {
+                    return;
+                }
+                info!(
+                    "Processing file {} (ID: {}, tags: {tags:?})",
+                    track,
+                    path.display()
+                );
                 let mut ictx = format::input(path).unwrap();
                 let context_or_stream = if ictx.metadata().iter().count() != 0 {
                     ContextOrStream::Context(&ictx)
@@ -687,6 +649,10 @@ fn write_tags(
                 temp_path.set_extension(
                     path.extension().unwrap().to_string_lossy().into_owned() + ".tmp",
                 );
+                if temp_path.as_os_str().len() > 255 {
+                    eprintln!("Path {} is too long, skipping file", temp_path.display(),);
+                    continue;
+                }
                 let mut octx = format::output_as(&temp_path, "ogg").unwrap();
                 let mut stream_mapping: Vec<i32> = vec![0; ictx.nb_streams() as _];
                 let mut ist_time_bases = vec![Rational(0, 1); ictx.nb_streams() as _];
@@ -702,22 +668,32 @@ fn write_tags(
                     ost_index += 1;
                     let mut ost = octx.add_stream(encoder::find(codec::Id::OPUS)).unwrap();
                     ost.set_parameters(ist.parameters());
+                    // SAFETY: we just set ost parameters above and no one else has had a chance to grab a pointer to it yet
                     unsafe {
                         (*ost.parameters().as_mut_ptr()).codec_tag = 0;
                     }
                 }
                 let mut metadata_changed = false;
-                for (_tag_marker, tag) in tags {
+                for tag in tags {
                     let tag_name = tag.get_message().expect("Tag without message");
                     let tag_contents = tag.to_string();
                     match context_or_stream {
                         ContextOrStream::Context(ictx) => {
                             let mut octx_metadata = ictx.metadata().to_owned();
-                            if !overwrite_tags && octx_metadata.get(tag_name).is_some() {
+                            if !overwrite_tags
+                                && (!matches!(tag, Tag::Popularity(_))
+                                    && octx_metadata.get(tag_name).is_some())
+                                || (matches!(tag, Tag::Popularity(_))
+                                    && octx_metadata.get("comment").is_some())
+                            {
                                 continue;
                             }
-                            octx_metadata.set(tag_name, &tag_contents);
-                            octx.set_metadata(octx_metadata);
+                            if let Tag::Popularity(_) = tag {
+                                octx.set_popularity(octx_metadata, tag_contents);
+                            } else {
+                                octx_metadata.set(tag_name, &tag_contents);
+                                octx.set_metadata(octx_metadata);
+                            }
                             metadata_changed = true;
                         }
                         ContextOrStream::Stream(input) => {
@@ -731,20 +707,30 @@ fn write_tags(
                                 })
                                 .unwrap();
                             let mut output_metadata = input.metadata().to_owned();
-                            if !overwrite_tags && output_metadata.get(tag_name).is_some() {
+                            if !overwrite_tags
+                                && (!matches!(tag, Tag::Popularity(_))
+                                    && output_metadata.get(tag_name).is_some())
+                                || (matches!(tag, Tag::Popularity(_))
+                                    && output_metadata.get("comment").is_some())
+                            {
                                 continue;
                             }
-                            output_metadata.set(tag_name, &tag_contents);
-                            output.set_metadata(output_metadata);
+                            if let Tag::Popularity(_) = tag {
+                                output.set_popularity(output_metadata, tag_contents);
+                            } else {
+                                output_metadata.set(tag_name, &tag_contents);
+                                output.set_metadata(output_metadata);
+                            }
                             metadata_changed = true;
                         }
                     }
                 }
 
                 if !metadata_changed {
-                    fs::remove_file(temp_path).unwrap();
+                    fs::remove_file(&temp_path).unwrap();
                     progress_tx.send(Completion(1)).unwrap();
-                    return;
+                    set_track_written(tags_to_write, track);
+                    continue;
                 }
 
                 octx.write_header().unwrap();
@@ -769,106 +755,223 @@ fn write_tags(
 
                 octx.write_trailer().unwrap();
 
-                fs::remove_file(path).unwrap();
-                fs::rename(temp_path, path).unwrap();
+                // don't delete original if temp doesn't exist
+                let Ok(_) = fs::metadata(&temp_path) else {
+                    eprintln!(
+                        "Temp file {} disappeared before processing, continuing",
+                        temp_path.display()
+                    );
+                    continue;
+                };
+
+                fs::remove_file(path).unwrap_or_else(|_| {
+                    panic!(
+                        "{}",
+                        format!("{} disappeared before deletion", path.display())
+                    )
+                });
+                fs::rename(&temp_path, path).unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to rename {} to {}",
+                        temp_path.display(),
+                        path.display()
+                    )
+                });
+                set_track_written(tags_to_write, track);
                 progress_tx.send(Completion(1)).unwrap()
-            }));
-        }
-        drop(progress_tx); // need to drop all tx to make progress_rx return Err
-        let start = Instant::now();
-        let mut elapsed_time; // unit is ms
-        let mut eta; // unit is s
-        for progress in progress_rx {
-            progress_total += progress.0 as f64 / tags_len as f64;
-            elapsed_time = start.elapsed().as_millis();
-            eta = ((1.0 / progress_total) * elapsed_time as f64 - elapsed_time as f64) / 1000.0;
-            println!(
-                "Progress: {:.2}%, ETA: {:.0}m{:.0}s, ",
-                progress_total * 100.0,
-                eta / 60.0 + 1.0,
-                eta % 60.0
-            );
-        }
-        for handle in handles {
-            if let Err(e) = handle.join() {
-                println!("Error from tag writing thread: {:?}", e);
             }
-        }
-    });
+        }));
+    }
+
+    for (track, tags) in tags_read_lock.iter() {
+        tx.send((
+            track.clone(),
+            tags.iter()
+                .filter(|tag| !matches!(tag, Tag::_Written(_)))
+                .cloned()
+                .collect::<Vec<_>>()
+                .clone(),
+        ))?;
+    }
+
+    drop(progress_tx); // need to drop all tx to make progress_rx return Err
+    let start = Instant::now();
+    let mut elapsed_time; // unit is ms
+    let mut eta; // unit is s
+    for progress in progress_rx {
+        progress_total += progress.0 as f64 / tags_len as f64;
+        elapsed_time = start.elapsed().as_millis();
+        eta = ((1.0 / progress_total) * elapsed_time as f64 - elapsed_time as f64) / 1000.0;
+        println!(
+            "Progress: {:.2}%, ETA: {:.0}m{:.0}s, ",
+            progress_total * 100.0,
+            eta / 60.0 + 1.0,
+            eta % 60.0
+        );
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|e| anyhow::anyhow!("Thread panicked: {e:?}"))?;
+    }
+
     println!("Finished!");
+
+    if use_cache {
+        let tags_json = serde_json::to_string(&*tags_by_track.read().expect("Poisoned lock"))?;
+        fs::write("tags_by_track.json", tags_json)?;
+    }
 
     Ok(())
 }
 
-fn cleanup_tags(tags_by_track: Arc<RwLock<TagsByTrack>>) {
-    for (_track, tags) in tags_by_track
-        // .lock()
-        .write()
+fn set_track_written(tags_to_write: Arc<Mutex<TagsByTrack>>, track: TrackId<'static>) {
+    *tags_to_write
+        .lock()
         .expect("Poisoned lock")
-        .tags
+        .get_mut(&track)
+        .expect("Missing track ID")
         .iter_mut()
-    {
-        tags.retain(|_marker, tag| match tag {
-            Tag::Genre(genres) => {
-                if genres.is_empty() {
-                    false
-                } else {
-                    genres.sort();
-                    genres.dedup();
-                    true
-                }
+        .find(|tag| matches!(tag, Tag::_Written(_)))
+        .expect("Expected to find _Written tag") = Tag::_Written(true);
+}
+
+fn clean_up_tags(tags_by_track: Arc<RwLock<TagsByTrack>>) {
+    for (_track, tags) in tags_by_track.write().expect("Poisoned lock").iter_mut() {
+        for tag in tags.iter_mut() {
+            if let Tag::Genre(genres) = tag {
+                genres.sort();
+                genres.dedup();
             }
-            _ => true,
-        });
+        }
     }
 }
 
 fn handle_dry_run(tags_by_track: Arc<RwLock<TagsByTrack>>) -> Result<()> {
-    let tags = tags_by_track
-        // .lock()
-        .read()
-        .expect("Poisoned lock");
-    let tracks_total = tags.tags.len();
-    let found_tags_total = tags.tags.len();
-    let empty_tags_total = tracks_total - found_tags_total;
-    println!("Dry run: found tags for {} tracks", found_tags_total);
-    if empty_tags_total > 0 {
-        println!("...but not {} tracks", empty_tags_total);
-    }
+    let tags = tags_by_track.read().expect("Poisoned lock");
+    let tracks_total = tags.len();
+    println!("Dry run: found tags for {} tracks", tracks_total);
     println!("Sample data:");
-    let tags_vec: Vec<_> = tags.tags.iter().take(25).collect();
+    let tags_vec: Vec<_> = tags.iter().take(25).collect();
     for (track, tag) in tags_vec {
         println!("{track}: {tag:?}");
     }
     Ok(())
 }
 
-fn query_and_write_tags(
-    args: &Args,
+fn find_tracks_missing_tags(
     tags_by_track: Arc<RwLock<TagsByTrack>>,
+    tags: &Vec<TagType>,
     paths_to_query: Arc<Mutex<PathsByTrackId>>,
-    genres_by_artist: Arc<Mutex<GenresByArtist>>,
+) {
+    let tags_lock = tags_by_track.read().expect("Poisoned lock");
+    paths_to_query
+        .lock()
+        .expect("Poisoned lock")
+        .retain(|track_id, _| {
+            let Some(track_tags) = tags_lock.get(track_id) else {
+                return true;
+            };
+            let mut track_tags: Vec<TagType> = track_tags
+                .iter()
+                .map(|tag| tag.into())
+                .filter(|&tag| tag != TagType::_Written)
+                .collect::<Vec<_>>();
+            track_tags.sort();
+            if track_tags != *tags {
+                trace!(
+                    "Track {track_id} is missing tags: expected {:?}, found {:?}",
+                    tags, track_tags
+                );
+                true
+            } else {
+                false
+            }
+        });
+}
+
+enum Backend {
+    Spotify(Credentials),
+    // Annas(Connection),
+}
+
+impl Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Spotify(_) => write!(f, "Spotify"),
+            // Backend::Annas(_) => write!(f, "Anna's Archive SQLite DB"),
+        }
+    }
+}
+
+fn query_and_write_tags(
+    tags_by_track: Arc<RwLock<TagsByTrack>>,
+    paths_by_track_id: Arc<Mutex<PathsByTrackId>>,
+    args: Args,
+    backend: Backend,
 ) -> Result<()> {
-    get_tags_from_spotify(
-        &args,
-        Arc::clone(&paths_to_query),
-        Arc::clone(&tags_by_track),
-        genres_by_artist,
-    )?;
-    cleanup_tags(Arc::clone(&tags_by_track));
+    if args.use_cache {
+        let paths_to_query = Arc::new(Mutex::new(
+            paths_by_track_id.lock().expect("Poisoned lock").clone(),
+        ));
+        find_tracks_missing_tags(
+            Arc::clone(&tags_by_track),
+            &args.tag,
+            Arc::clone(&paths_to_query),
+        );
+        let paths_diff_len = paths_to_query.lock().expect("Poisoned lock").len();
+        if paths_diff_len > 0 {
+            println!(
+                "Filling in gaps for {} songs from {backend}...",
+                paths_diff_len
+            );
+            match backend {
+                Backend::Spotify(creds) => {
+                    get_tags_from_spotify(
+                        args.tag,
+                        Arc::clone(&paths_to_query),
+                        Arc::clone(&tags_by_track),
+                        creds,
+                    )?;
+                } // Backend::Annas(_) => todo!(),
+            }
+        } else {
+            println!("All tags found in cache!");
+        }
+    } else {
+        match backend {
+            Backend::Spotify(creds) => {
+                get_tags_from_spotify(
+                    args.tag,
+                    Arc::clone(&paths_by_track_id),
+                    Arc::clone(&tags_by_track),
+                    creds,
+                )?;
+            } // Backend::Annas(_) => todo!(),
+        }
+    }
+
+    if args.use_cache {
+        let tags_json = serde_json::to_string(&*tags_by_track.read().expect("Poisoned lock"))?;
+        fs::write("tags_by_track.json", tags_json).context("while writing tags_by_track.json")?;
+    }
+
+    clean_up_tags(Arc::clone(&tags_by_track));
+
     if args.dry_run {
         return handle_dry_run(Arc::clone(&tags_by_track));
     }
+
     write_tags(
         Arc::clone(&tags_by_track),
-        Arc::clone(&paths_to_query),
+        Arc::clone(&paths_by_track_id),
         args.use_cache,
         args.overwrite_tags,
     )
 }
 
 fn main() -> Result<()> {
-    console_subscriber::init();
     // Handle background panics in threads or futures
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -882,7 +985,7 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     let Ok(base_path) = env::var("BASE_PATH") else {
-        panic!("Pass zotify download directory as BASE_PATH environment var");
+        panic!("Pass zotify download directory as BASE_PATH environment variable");
     };
     println!("Getting folders in {base_path}");
     let paths_by_track_id: Arc<Mutex<PathsByTrackId>> = Arc::new(Mutex::new(HashMap::new()));
@@ -901,13 +1004,8 @@ fn main() -> Result<()> {
     println!("...excluding {not_found_counter} tracks not found");
     println!("...and {error_counter} errors");
 
-    // enum Backend {
-    //     Spotify(Credentials),
-    //     Annas(Connection),
-    // }
-
     // let Ok(sqlite_db_path) = env::var("CLEAN_DB_PATH") else {
-    //     panic!("Pass `spotify_clean.sqlite3` from Anna's as CLEAN_DB_PATH environment var");
+    //     panic!("Pass `spotify_clean.sqlite3` from Anna's as CLEAN_DB_PATH environment variable");
     // };
 
     // sqlite::open(env::var("CLEAN_DB_PATH")?);
@@ -915,78 +1013,31 @@ fn main() -> Result<()> {
     let method = if args.use_cache { "disk" } else { "Spotify" };
     println!("Grabbing tags from {method}...");
 
-    // Only needed for genre tagging otherwise unused
-    let genres_by_artist: Arc<Mutex<HashMap<ArtistId, Vec<String>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
     let tags_by_track = if args.use_cache
         && let Ok(mut tags_json_from_disk) = File::open("tags_by_track.json")
     {
         let mut tags_str = String::new();
         tags_json_from_disk.read_to_string(&mut tags_str)?;
         Arc::new(RwLock::new(
-            serde_json::from_str(&tags_str).context("while serializing tags_by_track.json")?,
+            serde_json::from_str::<TagsByTrack>(&tags_str)
+                .context("while serializing tags_by_track.json")?,
         ))
     } else {
-        Arc::new(RwLock::new(TagsByTrack {
-            tags: HashMap::new(),
-        }))
+        Arc::new(RwLock::new(HashMap::new()))
     };
 
     args.tag.sort();
 
-    let backend = "Spotify";
+    let backend = Backend::Spotify(
+        Credentials::from_env().ok_or(anyhow!("Couldn't get Spotify credentials"))?,
+    );
 
-    if args.use_cache {
-        let paths_to_query = Arc::new(Mutex::new(
-            paths_by_track_id.lock().expect("Poisoned lock").clone(),
-        ));
-        {
-            let tags_lock = tags_by_track
-                // .lock()
-                .write()
-                .expect("Poisoned lock");
-
-            paths_to_query
-                .lock()
-                .expect("Poisoned lock")
-                .retain(|track_id, _| {
-                    let Some(track_tags_map) = tags_lock.tags.get(track_id) else {
-                        return true;
-                    };
-                    let mut track_tags = track_tags_map.keys().cloned().collect::<Vec<_>>();
-                    track_tags.sort();
-                    track_tags != args.tag
-                });
-        }
-        let paths_diff_len = paths_to_query.lock().expect("Poisoned lock").len();
-        if paths_diff_len > 0 {
-            println!(
-                "Filling in gaps for {} songs from {backend}...",
-                paths_diff_len
-            );
-            query_and_write_tags(
-                &args,
-                Arc::clone(&tags_by_track),
-                paths_to_query,
-                genres_by_artist,
-            )
-        } else {
-            println!("All tags found in cache!");
-            write_tags(
-                Arc::clone(&tags_by_track),
-                paths_to_query,
-                args.use_cache,
-                args.overwrite_tags,
-            )
-        }
-    } else {
-        query_and_write_tags(
-            &args,
-            Arc::clone(&tags_by_track),
-            paths_by_track_id,
-            genres_by_artist,
-        )
-    }
+    query_and_write_tags(
+        Arc::clone(&tags_by_track),
+        Arc::clone(&paths_by_track_id),
+        args,
+        backend,
+    )
 }
 
 // #[cfg(test)]
